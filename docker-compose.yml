@@ -1,0 +1,78 @@
+name: lab-inbox-bridge
+
+# Two independent web/collector instances plus a local IMAP demonstration
+# source.  Both instances share one SQLite database and one immutable store
+# volume, exactly like two replicas behind a load balancer.
+#
+#   docker compose up --build
+#   web-a: http://localhost:8000   web-b: http://localhost:8001
+#   demo IMAP: localhost:1143      demo console: http://localhost:8081
+
+x-common: &common
+  build: .
+  image: lab-inbox-bridge:local
+  restart: unless-stopped
+  depends_on:
+    demo-imap:
+      condition: service_healthy
+  environment: &common-env
+    DATABASE_PATH: /data/bridge.sqlite3
+    STORAGE_DIR: /data/store
+    IMAP_HOST: demo-imap
+    IMAP_PORT: "1143"
+    IMAP_ACCOUNT: lab@demo
+    IMAP_USER: lab
+    IMAP_PASSWORD: lab-pass
+    IMAP_MAILBOX: INBOX
+    # 0 = only explicit scans from the web page / API (deterministic demo).
+    # Set to e.g. 20 to let both instances poll automatically; the scan lease
+    # makes sure only one of them advances the mailbox at a time.
+    AUTO_SCAN_INTERVAL: "0"
+    SCAN_LEASE_SECONDS: "60"
+  volumes:
+    - shared-data:/data
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    start_period: 5s
+
+services:
+  demo-imap:
+    build: .
+    image: lab-inbox-bridge:local
+    restart: unless-stopped
+    command:
+      ["python", "-m", "imap_demo.server", "--imap-port", "1143", "--control-port", "8081", "--data", "/demo-data"]
+    volumes:
+      - demo-data:/demo-data
+    ports:
+      - "1143:1143"
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+
+  web-a:
+    <<: *common
+    environment:
+      <<: *common-env
+      INSTANCE_ID: web-a
+    ports:
+      - "8000:8000"
+
+  web-b:
+    <<: *common
+    environment:
+      <<: *common-env
+      INSTANCE_ID: web-b
+    ports:
+      - "8001:8000"
+
+volumes:
+  shared-data:
+  demo-data:

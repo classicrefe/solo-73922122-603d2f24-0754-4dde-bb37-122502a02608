@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ cfg.title }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>{{ cfg.title }}</h1>
+  <p>实验室共享邮箱 → 入仓作业。附件与回执持久化后才标记已读，重试不产生重复报告。</p>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>
+  <span>实例 <code>{{ cfg.instance_id }}</code></span>
+  <span>数据库 <code>{{ cfg.database_path }}</code></span>
+  <span>存储 <code>{{ cfg.storage_dir }}</code></span>
+</footer>
+</body>
+</html>

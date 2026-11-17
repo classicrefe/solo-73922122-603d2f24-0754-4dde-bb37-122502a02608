@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block content %}
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="flash bad">错误：{{ error }}</div>{% endif %}
+
+<section class="cards">
+  <div class="card"><span>邮件记录</span><strong>{{ stats.messages }}</strong></div>
+  <div class="card"><span>收讫</span><strong>{{ stats.accepted }}</strong></div>
+  <div class="card"><span>拒收</span><strong>{{ stats.rejected }}</strong></div>
+  <div class="card"><span>已入库报告</span><strong>{{ stats.reports }}</strong></div>
+  <div class="card warn"><span>待标记</span><strong>{{ stats.pending_marks }}</strong></div>
+  <div class="card"><span>已标记</span><strong>{{ stats.marked }}</strong></div>
+  <div class="card"><span>旧代失效标记</span><strong>{{ stats.stale_marks }}</strong></div>
+</section>
+
+<section class="panel">
+  <h2>采集状态</h2>
+  <dl class="kv">
+    <dt>实例</dt><dd><code>{{ cfg.instance_id }}</code></dd>
+    <dt>账号 / 邮箱</dt><dd><code>{{ cfg.account }} / {{ cfg.imap_mailbox }}</code></dd>
+    <dt>采集范围</dt><dd>INBOX 全部 UID（不依赖未读状态）</dd>
+    <dt>UIDVALIDITY</dt><dd>{{ state.uidvalidity or "—" }}</dd>
+    <dt>代数 generation</dt><dd>{{ state.generation or "—" }}</dd>
+    <dt>已推进 UID</dt><dd>{{ state.last_uid or 0 }}</dd>
+    <dt>当前租约</dt><dd>{% if state.scan_token %}{{ state.scan_instance }}（{{ state.scan_started_at }}）{% else %}空闲{% endif %}</dd>
+  </dl>
+  <div class="actions">
+    <form method="post" action="/actions/scan"><button type="submit">立即采集</button></form>
+    <form method="post" action="/actions/retry-marks"><button type="submit" class="secondary">重试待标记</button></form>
+  </div>
+  <p class="hint">采集由数据库租约协调：两实例可同时运行，但同一时刻只有一个推进邮箱进度。全部附件与回执落盘并提交后才标记已读；标记结果本地未确认时保留为“待标记”，可在此重试。</p>
+</section>
+
+<section class="panel">
+  <h2>邮件记录</h2>
+  <p class="filters">
+    <a href="/" class="{{ 'active' if not mark_filter }}">全部</a>
+    <a href="/?mark=pending" class="{{ 'active' if mark_filter == 'pending' }}">待标记</a>
+    <a href="/?mark=marked" class="{{ 'active' if mark_filter == 'marked' }}">已标记</a>
+    <a href="/?mark=stale" class="{{ 'active' if mark_filter == 'stale' }}">失效</a>
+  </p>
+  <table>
+    <thead><tr>
+      <th>#</th><th>时间</th><th>UID / UIDVALIDITY</th><th>主题</th>
+      <th>结果</th><th>标记</th><th>报告号</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+    {% for m in messages %}
+      <tr class="{{ 'row-bad' if m.decision == 'rejected' else '' }}">
+        <td>{{ m.id }}</td>
+        <td class="nowrap">{{ m.created_at }}</td>
+        <td>{{ m.uid }} / {{ m.uidvalidity }}</td>
+        <td>{{ m.subject or "—" }}</td>
+        <td>
+          {% if m.decision == "accepted" %}
+            <span class="badge ok">收讫</span>
+          {% else %}
+            <span class="badge bad">拒收</span>
+            <div class="reason">{{ m.reason }}</div>
+            {% if m.detail_list %}
+              <ul class="reasons">
+                {% for r in m.detail_list %}<li><code>{{ r.code }}</code> {{ r.message }}</li>{% endfor %}
+              </ul>
+            {% endif %}
+          {% endif %}
+        </td>
+        <td>
+          <span class="badge {{ 'ok' if m.mark_state == 'marked' else ('bad' if m.mark_state == 'stale' else 'warn') }}">
+            {{ {"pending":"待标记","marked":"已标记","stale":"旧代失效"}[m.mark_state] }}
+          </span>
+          {% if m.mark_attempts %}<div class="reason">尝试 {{ m.mark_attempts }} 次</div>{% endif %}
+        </td>
+        <td>
+          {% for r in m.report_nos_list %}<code>{{ r }}</code> {% endfor %}
+        </td>
+        <td class="nowrap">
+          <a href="/api/messages/{{ m.id }}/original">原件</a>
+          <a href="/api/messages/{{ m.id }}/receipt">回执</a>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="empty">暂无记录。点击“立即采集”或在邮件源投递邮件。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>入仓报告</h2>
+  <table>
+    <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th><th>原件 SHA-256</th><th>附件</th></tr></thead>
+    <tbody>
+    {% for r in reports %}
+      <tr>
+        <td><code>{{ r.report_no }}</code></td>
+        <td>{{ r.sample_no }}</td>
+        <td>{{ r.item }}</td>
+        <td>{{ r.value }}</td>
+        <td class="mono">{{ r.attachment_sha256[:16] }}…</td>
+        <td><a href="/api/reports/{{ r.id }}/attachment">{{ r.attachment_name }}</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="empty">暂无报告。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>最近扫描</h2>
+  <table>
+    <thead><tr><th>#</th><th>实例</th><th>状态</th><th>开始</th><th>结束</th>
+      <th>读取</th><th>收讫</th><th>拒收</th><th>跳过</th><th>复用</th><th>标记</th><th>说明</th></tr></thead>
+    <tbody>
+    {% for s in scans %}
+      <tr>
+        <td>{{ s.id }}</td>
+        <td><code>{{ s.instance }}</code></td>
+        <td><span class="badge {{ 'ok' if s.status == 'completed' else ('bad' if s.status == 'failed' else 'warn') }}">{{ s.status }}</span></td>
+        <td class="nowrap">{{ s.started_at }}</td>
+        <td class="nowrap">{{ s.finished_at or "—" }}</td>
+        <td>{{ s.scanned }}</td><td>{{ s.accepted }}</td><td>{{ s.rejected }}</td>
+        <td>{{ s.skipped }}</td><td>{{ s.reused_reports }}</td><td>{{ s.marked }}</td>
+        <td class="reason">{{ s.error or "" }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="12" class="empty">暂无扫描。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

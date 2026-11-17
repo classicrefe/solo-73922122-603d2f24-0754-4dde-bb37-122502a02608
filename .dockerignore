@@ -1,0 +1,7 @@
+# Docker build context hygiene: never ship local state or caches.
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+data/
+*.sqlite3
