@@ -99,3 +99,51 @@ def test_second_instance_is_conflict_when_lease_taken(demo):
 def test_missing_message_returns_404(demo):
     client = _client(demo)
     assert client.get("/api/messages/999").status_code == 404
+
+
+def test_uid_swap_anomaly_visible_in_api_and_dashboard(demo):
+    uid = demo.deliver("swap-me", [demo.attachment("R1")])
+    demo.maildir.fail_next_store = True  # mark temporarily fails, stays pending
+    client = _client(demo)
+    client.post("/api/scan")
+    demo.replace(uid, "foreign-content", [demo.attachment("R9")])
+    client.post("/api/scan")
+
+    anomalies = client.get("/api/anomalies").json()
+    assert len(anomalies) == 1
+    anomaly = anomalies[0]
+    assert anomaly["uid"] == uid
+    assert anomaly["reason_code"] == "uid_content_changed"
+
+    # The message still shows the acceptance plus the anomaly linkage.
+    message = client.get(f"/api/messages/{anomaly['message_id']}").json()
+    assert message["decision"] == "accepted"
+    assert message["mark_state"] == "pending"
+    assert len(message["anomalies"]) == 1
+    assert message["anomalies"][0]["observed_sha256"] == anomaly["observed_sha256"]
+
+    # Dashboard renders the anomaly panel and the per-message badge.
+    page = client.get("/").text
+    assert "UID 异常" in page
+    assert "uid_content_changed" in page
+    assert anomaly["observed_sha256"][:16] in page
+
+    # The forensic copy of the swapped-in bytes is downloadable.
+    observed = client.get(f"/api/anomalies/{anomaly['id']}/observed")
+    assert observed.status_code == 200
+    assert b"foreign-content" in observed.content
+
+    # Stats expose the anomaly count.
+    stats = client.get("/api/status").json()["stats"]
+    assert stats["uid_anomalies"] == 1
+
+    # Scan summary mentions anomalies.
+    response = client.post("/actions/scan", follow_redirects=True)
+    assert "UID 异常" in response.text
+
+
+def test_anomaly_endpoints_404(demo):
+    client = _client(demo)
+    assert client.get("/api/anomalies/999").status_code == 404
+    assert client.get("/api/anomalies/999/observed").status_code == 404
+

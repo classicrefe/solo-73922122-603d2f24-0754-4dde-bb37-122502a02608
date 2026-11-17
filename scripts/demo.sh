@@ -131,7 +131,66 @@ assert new and new[0]['decision']=='accepted' and 'DEMO-R6' in new[0]['report_no
 assert new[0]['raw_sha256'] != '$BEFORE_RAW', 'UID 1 must not inherit the old receipt'
 print('新代 UID 1:', new[0]['decision'], new[0]['mark_state'], new[0]['report_nos'], new[0]['raw_sha256'][:12])"
 
-step "8. 最终入库报告与标记状态"
+step "8. UID 异常：标记暂时失败后，服务器在 UIDVALIDITY 不变下换掉同一 UID 的原文"
+# 8a. 下一次 STORE 直接失败（不生效）：邮件已收讫但保持未读、本地待标记。
+curl -fsS -X POST "$DEMO/ctl/fail-store" -H 'Content-Type: application/json' -d '{"enabled":true}' >/dev/null
+SWAP_UID=$(curl -fsS -X POST "$DEMO/ctl/deliver" -H 'Content-Type: application/json' -d '{"subject":"演示-UID异常-原邮件","attachments":[
+  {"filename":"DEMO-R8.csv","report_no":"DEMO-R8","sample_no":"S008","item":"CRE","value":"70"}]}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["uid"])')
+echo "投递 UID=$SWAP_UID（标记将暂时失败）"
+curl -fsS -X POST "$APP_A/api/scan" | json
+SWAP_UV=$(curl -fsS "$APP_A/api/status" | python3 -c 'import json,sys;print(json.load(sys.stdin)["mailbox_state"]["uidvalidity"])')
+curl -fsS "$APP_A/api/status" | python3 -c 'import json,sys;s=json.load(sys.stdin)["stats"];print("待标记:",s["pending_marks"])'
+curl -fsS "$DEMO/api/state" | python3 -c "import json,sys
+m=[x for x in json.load(sys.stdin)['messages'] if x['uid']==$SWAP_UID][0]
+assert '\\\\Seen' not in m['flags'], m
+print('服务器侧 flags:', m['flags'], '（未读，标记确实未生效）')"
+
+# 8b. 服务器在同一 UID 上换掉原文（UIDVALIDITY 不变）。
+curl -fsS -X POST "$DEMO/ctl/replace" -H 'Content-Type: application/json' \
+  -d "{\"uid\":$SWAP_UID,\"subject\":\"演示-被替换的原文\",\"attachments\":[{\"filename\":\"DEMO-R9.csv\",\"report_no\":\"DEMO-R9\",\"sample_no\":\"S009\",\"item\":\"ALT\",\"value\":\"9\"}]}" | json
+
+# 8c. web-b 再采集：原收讫记录/回执/交付关联保留，异常只记一次；新原文不入库、不标记。
+curl -fsS -X POST "$APP_B/api/scan" | json
+step "8c-重复. web-a 再扫一次：同一异常仍只记一次"
+curl -fsS -X POST "$APP_A/api/scan" | json
+curl -fsS "$APP_A/api/anomalies" | python3 -c "import json,sys
+rows=[a for a in json.load(sys.stdin) if a['uid']==$SWAP_UID and a['uidvalidity']==$SWAP_UV]
+assert len(rows)==1, rows
+a=rows[0]
+assert a['reason_code']=='uid_content_changed'
+assert a['seen_count']==2, a
+print('异常记录（仅一条）:', a['uidvalidity'], a['uid'], a['reason_code'],
+      '原摘要', a['expected_sha256'][:12], '新摘要', a['observed_sha256'][:12], '次数', a['seen_count'])"
+curl -fsS "$APP_A/api/messages" | python3 -c "import json,sys
+rows=json.load(sys.stdin)
+m=[r for r in rows if r['uid']==$SWAP_UID and 'DEMO-R8' in (r.get('report_nos') or '')][0]
+assert m['decision']=='accepted' and m['mark_state']=='pending', (m['decision'], m['mark_state'])
+assert len(m['anomalies'])==1
+print('原收讫记录保留:', m['decision'], m['mark_state'], m['report_nos'], '回执', m['receipt_sha256'][:12])"
+curl -fsS "$APP_A/api/messages" | python3 -c "import json,sys
+rows=json.load(sys.stdin)
+assert not any('DEMO-R9' in (r.get('report_nos') or '') for r in rows), '换入的 DEMO-R9 不应入库'
+print('换入的新原文未入库（无 DEMO-R9 报告）')"
+curl -fsS "$DEMO/api/state" | python3 -c "import json,sys
+m=[x for x in json.load(sys.stdin)['messages'] if x['uid']==$SWAP_UID][0]
+assert '\\\\Seen' not in m['flags'], m
+print('换入的新原文仍未被标记已读:', m['flags'])"
+
+# 8d. 服务器恢复旧原文：待标记可以继续补标。
+curl -fsS -X POST "$DEMO/ctl/restore" -H 'Content-Type: application/json' -d "{\"uid\":$SWAP_UID}" | json
+curl -fsS -X POST "$APP_A/api/retry-marks" | json
+curl -fsS "$APP_A/api/messages" | python3 -c "import json,sys
+rows=json.load(sys.stdin)
+m=[r for r in rows if r['uid']==$SWAP_UID and 'DEMO-R8' in (r.get('report_nos') or '')][0]
+assert m['mark_state']=='marked', m['mark_state']
+print('恢复旧原文后补标记成功:', m['mark_state'])"
+curl -fsS "$DEMO/api/state" | python3 -c "import json,sys
+m=[x for x in json.load(sys.stdin)['messages'] if x['uid']==$SWAP_UID][0]
+assert '\\\\Seen' in m['flags'], m
+print('服务器侧 flags:', m['flags'])"
+
+step "9. 最终入库报告与标记状态"
 curl -fsS "$APP_A/api/messages?mark_state=marked" | python3 -c 'import json,sys
 rows=json.load(sys.stdin)
 for r in sorted(rows, key=lambda x: (x["uidvalidity"], x["uid"]))[-10:]:

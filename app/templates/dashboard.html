@@ -11,6 +11,7 @@
   <div class="card warn"><span>待标记</span><strong>{{ stats.pending_marks }}</strong></div>
   <div class="card"><span>已标记</span><strong>{{ stats.marked }}</strong></div>
   <div class="card"><span>旧代失效标记</span><strong>{{ stats.stale_marks }}</strong></div>
+  <div class="card {{ 'bad' if stats.uid_anomalies else '' }}"><span>UID 异常</span><strong>{{ stats.uid_anomalies }}</strong></div>
 </section>
 
 <section class="panel">
@@ -69,6 +70,10 @@
             {{ {"pending":"待标记","marked":"已标记","stale":"旧代失效"}[m.mark_state] }}
           </span>
           {% if m.mark_attempts %}<div class="reason">尝试 {{ m.mark_attempts }} 次</div>{% endif %}
+          {% if m.anomalies %}
+            <div class="reason"><span class="badge bad">UID 异常</span>
+              原文被替换 {{ m.anomalies|length }} 次，原收讫记录保留</div>
+          {% endif %}
         </td>
         <td>
           {% for r in m.report_nos_list %}<code>{{ r }}</code> {% endfor %}
@@ -80,6 +85,39 @@
       </tr>
     {% else %}
       <tr><td colspan="8" class="empty">暂无记录。点击“立即采集”或在邮件源投递邮件。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>UID 异常（UIDVALIDITY 未变但原文被替换）</h2>
+  <p class="hint">服务器在同一 UID 上换掉了原文：原收讫记录、回执与入仓报告的来源关联全部保留；
+    换入的新原文只记录 SHA-256 摘要与原因，不入库、不标记已读。服务器恢复旧原文后，
+    “重试待标记”可继续补标记；邮箱真正重建（UIDVALIDITY 变化）后按新代采入。</p>
+  <table>
+    <thead><tr>
+      <th>#</th><th>首次发现</th><th>最近发现</th><th>次数</th><th>UID / UIDVALIDITY</th>
+      <th>关联邮件</th><th>原摘要</th><th>新原文摘要</th><th>异常原因</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+    {% for a in anomalies %}
+      <tr class="row-bad">
+        <td>{{ a.id }}</td>
+        <td class="nowrap">{{ a.created_at }}</td>
+        <td class="nowrap">{{ a.last_seen_at }}</td>
+        <td>{{ a.seen_count }}</td>
+        <td>{{ a.uid }} / {{ a.uidvalidity }}</td>
+        <td><a href="/api/messages/{{ a.message_id }}">#{{ a.message_id }}</a></td>
+        <td class="mono">{{ a.expected_sha256[:16] }}…</td>
+        <td class="mono">{{ a.observed_sha256[:16] }}…</td>
+        <td><code>{{ a.reason_code }}</code><div class="reason">{{ a.reason }}</div></td>
+        <td class="nowrap">
+          {% if a.observed_path %}<a href="/api/anomalies/{{ a.id }}/observed">新原文</a>{% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="10" class="empty">暂无 UID 异常。</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -110,7 +148,7 @@
   <h2>最近扫描</h2>
   <table>
     <thead><tr><th>#</th><th>实例</th><th>状态</th><th>开始</th><th>结束</th>
-      <th>读取</th><th>收讫</th><th>拒收</th><th>跳过</th><th>复用</th><th>标记</th><th>说明</th></tr></thead>
+      <th>读取</th><th>收讫</th><th>拒收</th><th>跳过</th><th>复用</th><th>标记</th><th>异常</th><th>说明</th></tr></thead>
     <tbody>
     {% for s in scans %}
       <tr>
@@ -121,10 +159,11 @@
         <td class="nowrap">{{ s.finished_at or "—" }}</td>
         <td>{{ s.scanned }}</td><td>{{ s.accepted }}</td><td>{{ s.rejected }}</td>
         <td>{{ s.skipped }}</td><td>{{ s.reused_reports }}</td><td>{{ s.marked }}</td>
+        <td>{{ s.anomalies }}</td>
         <td class="reason">{{ s.error or "" }}</td>
       </tr>
     {% else %}
-      <tr><td colspan="12" class="empty">暂无扫描。</td></tr>
+      <tr><td colspan="13" class="empty">暂无扫描。</td></tr>
     {% endfor %}
     </tbody>
   </table>

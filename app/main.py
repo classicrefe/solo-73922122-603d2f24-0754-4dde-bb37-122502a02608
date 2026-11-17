@@ -41,6 +41,7 @@ def _message_view(db: Database, row) -> dict[str, Any]:
     except json.JSONDecodeError:
         item["report_nos_list"] = []
     item["reports"] = [dict(r) for r in db.reports_for_message(item["id"])]
+    item["anomalies"] = [dict(a) for a in db.anomalies_for_message(item["id"])]
     return item
 
 
@@ -123,6 +124,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
                 "stats": db.stats(),
                 "messages": messages,
                 "reports": reports,
+                "anomalies": [dict(a) for a in db.list_anomalies(50)],
                 "scans": [dict(r) for r in db.recent_scans(15)],
                 "state": _row_to_dict(state),
                 "mark_filter": mark_filter or "",
@@ -143,7 +145,8 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         summary = (
             f"扫描完成：读取 {result['scanned']}，收讫 {result['accepted']}，"
             f"拒收 {result['rejected']}，跳过 {result['skipped']}，"
-            f"标记 {result['marked']}，复用原件 {result['reused_reports']}"
+            f"标记 {result['marked']}，复用原件 {result['reused_reports']}，"
+            f"UID 异常 {result['anomalies']}"
         )
         if result["status"] != "completed":
             summary += f"；{result['error'] or result['status']}"
@@ -257,6 +260,35 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             path,
             media_type="text/csv; charset=utf-8",
             filename=row["attachment_name"],
+        )
+
+    @app.get("/api/anomalies")
+    def api_anomalies(limit: int = 100):
+        """Same-UID content swaps observed while UIDVALIDITY was unchanged."""
+        return [dict(a) for a in db.list_anomalies(limit)]
+
+    @app.get("/api/anomalies/{anomaly_id}")
+    def api_anomaly(anomaly_id: int):
+        row = db.get_anomaly(anomaly_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="anomaly not found")
+        return dict(row)
+
+    @app.get("/api/anomalies/{anomaly_id}/observed")
+    def download_anomaly_observed(anomaly_id: int):
+        """Forensic copy of the foreign bytes the server swapped in."""
+        row = db.get_anomaly(anomaly_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="anomaly not found")
+        if not row["observed_path"]:
+            raise HTTPException(status_code=410, detail="未保存异常原文")
+        path = store.absolute(row["observed_path"])
+        if not path.is_file():
+            raise HTTPException(status_code=410, detail="异常原文文件缺失")
+        return FileResponse(
+            path,
+            media_type="message/rfc822",
+            filename=f"anomaly-{row['uidvalidity']}-{row['uid']}-{row['observed_sha256'][:12]}.eml",
         )
 
     @app.exception_handler(Exception)

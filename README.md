@@ -50,6 +50,7 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 | 同号同原件复用 | 以附件 SHA-256 判定；相同则 `delivery.disposition='reused'`，报告只保留一份（`report` 表唯一键 `account+mailbox+report_no`） |
 | 全部附件与回执持久化后才标已读 | `Store.put_original/put_attachment/put_receipt` 均 `fsync` + 原子 rename；`_commit_acceptance` 提交后才进入 `_mark_pending` |
 | 标记已生效却断连 → 不重复报告 | 标记前重新 FETCH 并比对 `raw_sha256`；IMAP 连接中断时扫描记为 `interrupted`（已提交的不回退），该行保持 `pending`，`POST /api/retry-marks` 或下次扫描补标；重新扫描按 `(account,mailbox,uidvalidity,uid)` 去重 |
+| UIDVALIDITY 不变却换掉同一 UID 原文 → 保留原收讫，异常另记 | 已提交记录（决定、回执、报告、交付关联）一律不覆写；`uid_anomaly` 表按 `(account,mailbox,uidvalidity,uid,新原文SHA-256)` 只记一次，含新原文摘要、异常原因与取证副本；换入内容不入库、不标已读；记录保持 `pending`，服务器恢复旧原文后 `POST /api/retry-marks` 可补标（`tests/test_collector.py::test_uid_content_swap_keeps_acceptance_and_records_anomaly_once`） |
 | 入库后退出 / 重启 | 状态全在 SQLite + 文件卷；新进程续扫，报告幂等 |
 | UIDVALIDITY 变化后重扫 | `claim_scan`/`adopt_changed_uidvalidity` 提升 `generation`、清空 `last_uid` 与租约，旧代 `pending` 标记转 `stale` |
 | 复用 UID 不套旧回执 | 主键含 `uidvalidity`；标记前比对 UID 当前内容的 SHA-256，不一致则拒绝标记并转 `stale` |
@@ -64,6 +65,9 @@ IMAP_PORT=1143 IMAP_ACCOUNT=lab@demo AUTO_SCAN_INTERVAL=0 \
 3. **消息身份 = (account, mailbox, uidvalidity, uid)**；重试与重启只更新同一条记录。
 4. **旧扫描无写权限**：所有写操作都带扫描 token 与 UIDVALIDITY 条件；检测到重建即中止，且不标记、不推进 `last_uid`。
 5. **标记前内容校验**：UID 当前原文 SHA-256 必须等于入库时的 SHA-256。
+6. **同代 UID 内容变化不覆写**：UIDVALIDITY 未变而原文变化时，只新增 `uid_anomaly`
+   记录（幂等），原收讫记录、回执与交付关联保持不变；换入的原文永不标记 `\Seen`，
+   待标记行保持 `pending`，原文恢复后仍可补标。
 
 ## 存储布局
 
@@ -88,14 +92,19 @@ SHA-256、附件 SHA-256 与全部数据行，可脱离数据库核对。
 | GET | `/api/status` | 实例、IMAP 探测、统计、邮箱进度、当前租约 |
 | POST | `/api/scan` | 采集；另一实例持有租约时返回 409 |
 | POST | `/api/retry-marks` | 只补标记，不扫描新邮件 |
-| GET | `/api/messages?mark_state=` | 邮件记录（含 `detail_list` 拒收原因、`reports`） |
+| GET | `/api/messages?mark_state=` | 邮件记录（含 `detail_list` 拒收原因、`reports`、`anomalies`） |
 | GET | `/api/messages/{id}/original` | 下载原始 RFC822 原件 |
 | GET | `/api/messages/{id}/receipt` | 下载固定回执 JSON |
 | GET | `/api/reports/{id}/attachment` | 下载 CSV 原件 |
+| GET | `/api/anomalies` | UID 异常列表（同 UID 原文被替换：新摘要、原因、次数、关联邮件） |
+| GET | `/api/anomalies/{id}/observed` | 下载被换入原文的取证副本 |
 
 演示源控制 API（`demo-imap:8081`）：`POST /ctl/deliver` 投递、`POST /ctl/rebuild`
 （`{"purge":false}` 重建 UIDVALIDITY 并重排 UID）、`POST /ctl/drop-store`
-（下一次 STORE 生效后断连）、`GET /api/state`。
+（下一次 STORE 生效后断连）、`POST /ctl/fail-store`（下一次 STORE 不生效直接
+拒绝，模拟标记暂时失败）、`POST /ctl/replace`（`{"uid":N,…}` 在 UIDVALIDITY
+不变下换掉该 UID 的原文）、`POST /ctl/restore`（`{"uid":N}` 恢复被换掉的原文）、
+`GET /api/state`。
 
 ## 测试
 
@@ -106,7 +115,8 @@ python -m pytest -q
 
 覆盖：CSV 校验矩阵、整封拒收、同号同原件复用、同号异文冲突、预先已读、
 标记后断连 + 补标记、UIDVALIDITY 重建与 UID 复用、扫描中途重建、并发租约、
-重启续扫、下载接口与网页动作。
+重启续扫、下载接口与网页动作、同代 UID 原文被替换（保留收讫与来源、异常幂等、
+不标新原文、恢复后补标记、双实例一致、真正重建后按新代采入）。
 
 ## 配置项
 

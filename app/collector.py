@@ -15,6 +15,13 @@ Ordering rules implemented here:
    scan cannot mark messages from a rebuilt mailbox that reused UIDs.
 4. Progress (``last_uid``) advances only through conditional updates bound to
    the scan token and the UIDVALIDITY the scan selected.
+5. If the server swaps the raw content behind a UID *without* changing
+   UIDVALIDITY, the committed record is never rewritten: the acceptance
+   receipt, original, report rows and delivery links stay as they are, the
+   observation is recorded once in ``uid_anomaly`` (new content's SHA-256 +
+   reason), and the foreign content is never marked ``\Seen``.  The pending
+   mark survives, so when the server restores the original bytes the
+   acknowledgement is still applied.
 """
 
 from __future__ import annotations
@@ -67,6 +74,7 @@ class ScanResult:
             "skipped": 0,
             "reused_reports": 0,
             "marked": 0,
+            "anomalies": 0,
         }
     )
     error: str | None = None
@@ -297,6 +305,8 @@ class Collector:
             )
             if outcome == "skipped_duplicate":
                 result.counts["skipped"] += 1
+            elif outcome == "uid_anomaly":
+                result.counts["anomalies"] += 1
             elif outcome == "accepted":
                 result.counts["scanned"] += 1
             elif outcome == "rejected":
@@ -334,14 +344,12 @@ class Collector:
                 # which _mark_pending handles for every pending row.
                 return "skipped_duplicate"
             # Same mailbox generation, same UID, different bytes: the server
-            # violates UID immutability. Record a rejection rather than risk
-            # silent data loss.
-            self._commit_rejection(
-                uidvalidity, uid, raw, raw_sha, None,
-                [{"code": "uid_content_changed", "message": "同一 UID 的原文发生变化"}],
-                existing=existing,
-            )
-            return "rejected"
+            # violates UID immutability.  Never rewrite the committed record —
+            # its receipt, original, report rows and delivery links are the
+            # archive's provenance.  Record the anomaly once and leave the
+            # foreign content unmarked and uningested.
+            self._record_uid_anomaly(existing, uidvalidity, uid, raw, raw_sha)
+            return "uid_anomaly"
 
         try:
             parsed = parse_mail(raw)
@@ -354,16 +362,13 @@ class Collector:
             self._commit_rejection(
                 uidvalidity, uid, raw, raw_sha, None,
                 [{"code": "parse_error", "message": f"邮件无法解析：{exc}"}],
-                existing=existing,
             )
             return "rejected"
 
         # Conflict/reuse decisions are made inside the acceptance transaction
         # below, so two instances cannot both "win" between check and insert.
         if plans is None:
-            self._commit_rejection(
-                uidvalidity, uid, raw, raw_sha, parsed, reasons, existing=existing
-            )
+            self._commit_rejection(uidvalidity, uid, raw, raw_sha, parsed, reasons)
             return "rejected"
 
         accepted = self._commit_acceptance(
@@ -371,12 +376,58 @@ class Collector:
         )
         if "conflict" in accepted:
             self._commit_rejection(
-                uidvalidity, uid, raw, raw_sha, parsed, accepted["conflict"], existing=existing
+                uidvalidity, uid, raw, raw_sha, parsed, accepted["conflict"]
             )
             return "rejected"
         result.counts["accepted"] += 1
         result.counts["reused_reports"] += accepted["reused"]
         return "accepted"
+
+    # -------------------------------------------------------------- anomalies
+    def _record_uid_anomaly(
+        self,
+        existing,
+        uidvalidity: int,
+        uid: int,
+        raw: bytes,
+        raw_sha: str,
+    ) -> None:
+        """Keep the committed record; note the swapped-in content once.
+
+        A forensic copy of the foreign bytes is stored content-addressed (so
+        repeats are no-ops) and the observation is upserted into
+        ``uid_anomaly``; both instances therefore agree on a single row per
+        (UID, observed content) and the report archive keeps pointing at the
+        original acceptance.
+        """
+        account = self.settings.account
+        mailbox = self.settings.imap_mailbox
+        observed_sha = self.store.put_original(raw)
+        inserted = self.db.record_uid_anomaly(
+            account=account,
+            mailbox=mailbox,
+            uidvalidity=uidvalidity,
+            uid=uid,
+            message_id=existing["id"],
+            expected_sha256=existing["raw_sha256"],
+            observed_sha256=raw_sha,
+            reason_code="uid_content_changed",
+            reason=(
+                "同一 UID 的原文在 UIDVALIDITY 不变的情况下被替换；"
+                "已保留原收讫记录与回执，新原文未入库、未标记已读"
+            ),
+            scan_instance=self.settings.instance_id,
+            observed_path=f"msgs/{observed_sha}.eml",
+        )
+        log.warning(
+            "uid=%s uidvalidity=%s content swapped (expected %s…, observed %s…);"
+            " anomaly %s, committed record kept",
+            uid,
+            uidvalidity,
+            existing["raw_sha256"][:12],
+            raw_sha[:12],
+            "recorded" if inserted else "already known",
+        )
 
     # ---------------------------------------------------------------- commits
     def _commit_rejection(
@@ -387,8 +438,12 @@ class Collector:
         raw_sha: str,
         parsed,
         reasons: list[dict[str, Any]],
-        existing,
     ) -> None:
+        """Persist a whole-mail rejection for a UID seen for the first time.
+
+        Insert-only: a UID that already has a committed record is handled by
+        the anomaly path above, never by overwriting that record.
+        """
         account = self.settings.account
         mailbox = self.settings.imap_mailbox
         original_sha = self.store.put_original(raw)
@@ -411,69 +466,36 @@ class Collector:
         with self.db.connect() as conn:
             with transaction(conn):
                 generation = _current_generation(conn, account, mailbox)
-                if existing is None:
-                    conn.execute(
-                        """INSERT INTO message_record
-                           (account, mailbox, uidvalidity, uid, generation,
-                            raw_sha256, subject, from_addr, date_header,
-                            decision, reason_code, reason, mark_state,
-                            receipt_sha256, receipt_path, original_path,
-                            report_nos, detail, scan_instance, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rejected', ?, ?,
-                                   'pending', ?, ?, ?, '[]', ?, ?, ?, ?)""",
-                        (
-                            account,
-                            mailbox,
-                            uidvalidity,
-                            uid,
-                            generation,
-                            raw_sha,
-                            parsed.subject if parsed else None,
-                            parsed.from_addr if parsed else None,
-                            parsed.date_header if parsed else None,
-                            primary["code"],
-                            primary["message"],
-                            receipt_sha,
-                            str(receipt_rel),
-                            original_rel,
-                            _json(reasons),
-                            self.settings.instance_id,
-                            utcnow(),
-                            utcnow(),
-                        ),
-                    )
-                else:
-                    conn.execute(
-                        """UPDATE message_record
-                           SET generation=?, raw_sha256=?, subject=?, from_addr=?,
-                               date_header=?, decision='rejected', reason_code=?,
-                               reason=?, mark_state='pending', receipt_sha256=?,
-                               receipt_path=?, original_path=?, report_nos='[]',
-                               detail=?, scan_instance=?, updated_at=?
-                           WHERE id=?""",
-                        (
-                            generation,
-                            raw_sha,
-                            parsed.subject if parsed else None,
-                            parsed.from_addr if parsed else None,
-                            parsed.date_header if parsed else None,
-                            primary["code"],
-                            primary["message"],
-                            receipt_sha,
-                            str(receipt_rel),
-                            original_rel,
-                            _json(reasons),
-                            self.settings.instance_id,
-                            utcnow(),
-                            existing["id"],
-                        ),
-                    )
-                    # A prior acceptance for this UID is being overturned; its
-                    # traceability links must not survive, though the report
-                    # rows it created stay in the archive.
-                    conn.execute(
-                        "DELETE FROM delivery WHERE message_id=?", (existing["id"],)
-                    )
+                conn.execute(
+                    """INSERT INTO message_record
+                       (account, mailbox, uidvalidity, uid, generation,
+                        raw_sha256, subject, from_addr, date_header,
+                        decision, reason_code, reason, mark_state,
+                        receipt_sha256, receipt_path, original_path,
+                        report_nos, detail, scan_instance, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rejected', ?, ?,
+                               'pending', ?, ?, ?, '[]', ?, ?, ?, ?)""",
+                    (
+                        account,
+                        mailbox,
+                        uidvalidity,
+                        uid,
+                        generation,
+                        raw_sha,
+                        parsed.subject if parsed else None,
+                        parsed.from_addr if parsed else None,
+                        parsed.date_header if parsed else None,
+                        primary["code"],
+                        primary["message"],
+                        receipt_sha,
+                        str(receipt_rel),
+                        original_rel,
+                        _json(reasons),
+                        self.settings.instance_id,
+                        utcnow(),
+                        utcnow(),
+                    ),
+                )
 
     def _commit_acceptance(
         self,
@@ -706,6 +728,12 @@ class Collector:
         rebuilt while a mark was pending, UID N now belongs to a different
         message, the hash differs, and the row is quarantined as ``stale``
         instead of being marked with another message's receipt.
+
+        A hash mismatch *within* the live generation is different: the server
+        swapped the content behind the UID without changing UIDVALIDITY.  The
+        foreign content must not be marked, but the row stays ``pending`` —
+        the anomaly is recorded by the fetch phase, and if the server later
+        restores the original bytes the acknowledgement is still applied.
         """
         if not self.db.token_is_current(token, uidvalidity):
             return
@@ -736,11 +764,15 @@ class Collector:
                 self.db.set_mark_state(row["id"], "stale")
                 continue
             if hashlib.sha256(raw).hexdigest() != row["raw_sha256"]:
+                # Same-generation content swap: never mark the foreign bytes,
+                # never give up on the row either — a restore of the original
+                # content must still be able to complete the mark.
+                self.db.increment_mark_attempts(row["id"])
                 log.warning(
-                    "uid=%s now holds different content; refusing to mark (stale)",
+                    "uid=%s now holds different content; leaving mark pending "
+                    "(anomaly is recorded by the fetch phase)",
                     row["uid"],
                 )
-                self.db.set_mark_state(row["id"], "stale")
                 continue
             try:
                 typ, data = conn.uid("STORE", str(row["uid"]), "+FLAGS.SILENT", "(\\Seen)")

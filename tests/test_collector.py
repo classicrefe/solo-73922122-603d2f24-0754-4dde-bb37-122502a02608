@@ -236,3 +236,164 @@ def test_original_and_receipt_downloadable(demo):
     assert receipt["type"] == "acceptance"
     assert receipt["raw_sha256"] == row["raw_sha256"]
     assert receipt["reports"][0]["report_no"] == "R1"
+
+
+def test_uid_content_swap_keeps_acceptance_and_records_anomaly_once(demo):
+    """Server rewrites a UID's content while UIDVALIDITY stays the same.
+
+    The committed acceptance (record, receipt, reports, deliveries) must
+    survive; the swapped-in content is only noted as an anomaly, never
+    ingested, never marked read; re-scans do not duplicate the anomaly.
+    """
+    uid = demo.deliver("original", [demo.attachment("R1"), demo.attachment("R2")])
+    demo.maildir.fail_next_store = True  # mark temporarily fails, flag NOT applied
+    collector = demo.make_collector()
+    result = collector.scan()
+    assert result.counts["accepted"] == 1
+    before = _messages(collector)[0]
+    assert before["mark_state"] == "pending"
+    assert {m["uid"]: m["flags"] for m in demo.maildir.all_flags()}[uid] == []
+    receipt_sha = before["receipt_sha256"]
+    original_path = before["original_path"]
+
+    # The server swaps the bytes behind the same UID, same UIDVALIDITY.
+    assert demo.replace(uid, "swapped-by-server", [demo.attachment("R9")])
+    second = collector.scan()
+
+    assert second.counts["anomalies"] == 1
+    assert second.counts["rejected"] == 0
+    assert second.counts["accepted"] == 0
+    after = _messages(collector)[0]
+    # The committed record is untouched.
+    assert after["id"] == before["id"]
+    assert after["decision"] == "accepted"
+    assert after["receipt_sha256"] == receipt_sha
+    assert after["original_path"] == original_path
+    assert json.loads(after["report_nos"]) == ["R1", "R2"]
+    # Foreign content is not marked read; the row stays pending.
+    assert after["mark_state"] == "pending"
+    flags = {m["uid"]: m["flags"] for m in demo.maildir.all_flags()}
+    assert flags[uid] == []
+    # Deliveries and reports keep pointing at the original acceptance.
+    deliveries = collector.db.reports_for_message(after["id"])
+    assert {d["report_no"] for d in deliveries} == {"R1", "R2"}
+    reports = collector.db.list_reports()
+    assert {r["report_no"] for r in reports} == {"R1", "R2"}
+    assert all(r["source_message_id"] == after["id"] for r in reports)
+    # The swapped-in R9 was not ingested.
+    assert all(r["report_no"] != "R9" for r in reports)
+    # The anomaly carries both digests and the reason.
+    anomalies = collector.db.list_anomalies()
+    assert len(anomalies) == 1
+    anomaly = anomalies[0]
+    assert anomaly["uid"] == uid
+    assert anomaly["uidvalidity"] == before["uidvalidity"]
+    assert anomaly["message_id"] == before["id"]
+    assert anomaly["expected_sha256"] == before["raw_sha256"]
+    assert anomaly["observed_sha256"] != before["raw_sha256"]
+    assert anomaly["reason_code"] == "uid_content_changed"
+    assert anomaly["seen_count"] == 1
+    # A forensic copy of the foreign bytes is downloadable.
+    observed = collector.store.read(anomaly["observed_path"])
+    assert b"swapped-by-server" in observed
+
+    # Re-scanning the same anomaly records nothing new.
+    third = collector.scan()
+    assert third.counts["anomalies"] == 1
+    anomalies = collector.db.list_anomalies()
+    assert len(anomalies) == 1
+    assert anomalies[0]["seen_count"] == 2
+    assert _messages(collector)[0]["mark_state"] == "pending"
+    assert {m["uid"]: m["flags"] for m in demo.maildir.all_flags()}[uid] == []
+
+    # The server heals: original bytes are back, the pending mark completes.
+    assert demo.restore(uid)
+    marked = collector.mark_pending_public()
+    assert marked == 1
+    final = _messages(collector)[0]
+    assert final["mark_state"] == "marked"
+    assert {m["uid"]: m["flags"] for m in demo.maildir.all_flags()}[uid] == ["\\Seen"]
+    # History is kept: one message, one anomaly, reports still sourced.
+    assert len(_messages(collector)) == 1
+    assert len(collector.db.list_anomalies()) == 1
+    assert len(collector.db.list_reports()) == 2
+    assert all(r["source_message_id"] == before["id"] for r in collector.db.list_reports())
+
+
+def test_uid_swap_then_genuine_rebuild_collects_new_generation(demo):
+    """A real rebuild (UIDVALIDITY change) still collects the new content."""
+    uid = demo.deliver("before-swap", [demo.attachment("R1")])
+    demo.maildir.fail_next_store = True
+    collector = demo.make_collector()
+    collector.scan()
+    assert _messages(collector)[0]["mark_state"] == "pending"
+    demo.replace(uid, "swapped", [demo.attachment("R9")])
+    collector.scan()
+    assert len(collector.db.list_anomalies()) == 1
+
+    # Genuine rebuild: new UIDVALIDITY, the swapped content stays as UID 1.
+    demo.maildir.rebuild(purge=False)
+    result = collector.scan()
+
+    assert result.uidvalidity == 2
+    rows = _messages(collector)
+    old = [r for r in rows if r["uidvalidity"] == 1][0]
+    assert old["mark_state"] == "stale"
+    new = [r for r in rows if r["uidvalidity"] == 2][0]
+    # The content that was only an anomaly in the old generation is now
+    # collected as a new-generation message.
+    assert new["decision"] == "accepted"
+    assert json.loads(new["report_nos"]) == ["R9"]
+    assert new["mark_state"] == "marked"
+    # Old generation kept its own record and receipt.
+    assert old["decision"] == "accepted"
+    assert json.loads(old["report_nos"]) == ["R1"]
+    assert len(collector.db.list_anomalies()) == 1
+
+
+def test_uid_swap_recorded_once_across_two_instances(demo):
+    """Both instances observe the swap; the anomaly stays a single row and
+    the report source is identical from either instance's point of view."""
+    uid = demo.deliver("shared", [demo.attachment("R1")])
+    demo.maildir.fail_next_store = True
+    inst_a = demo.make_collector("inst-a")
+    inst_a.scan()
+    demo.replace(uid, "swapped", [demo.attachment("R9")])
+
+    inst_b = demo.make_collector("inst-b")
+    inst_b.scan()
+    inst_a.scan()
+
+    anomalies = inst_a.db.list_anomalies()
+    assert len(anomalies) == 1
+    assert anomalies[0]["seen_count"] == 2
+    reports = inst_b.db.list_reports()
+    assert len(reports) == 1
+    message = inst_b.db.get_message(reports[0]["source_message_id"])
+    assert message["decision"] == "accepted"
+    assert message["raw_sha256"] == anomalies[0]["expected_sha256"]
+    # The foreign content was never marked by either instance.
+    assert {m["uid"]: m["flags"] for m in demo.maildir.all_flags()}[uid] == []
+
+
+def test_rejected_record_also_survives_uid_swap(demo):
+    """A rejected message's record is not rewritten by a later swap either."""
+    uid = demo.deliver("bad", [{"filename": "R1.csv", "content": "bad,header\n1,2\n"}])
+    demo.maildir.fail_next_store = True  # keep the record pending
+    collector = demo.make_collector()
+    collector.scan()
+    before = _messages(collector)[0]
+    assert before["decision"] == "rejected"
+    assert before["mark_state"] == "pending"
+
+    demo.replace(uid, "replacement", [demo.attachment("R5")])
+    result = collector.scan()
+
+    assert result.counts["anomalies"] == 1
+    after = _messages(collector)[0]
+    assert after["decision"] == "rejected"
+    assert after["receipt_sha256"] == before["receipt_sha256"]
+    assert after["reason_code"] == "bad_header"
+    assert collector.db.list_reports() == []
+    assert len(collector.db.list_anomalies()) == 1
+

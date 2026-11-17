@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utcnow() -> str:
@@ -163,6 +163,31 @@ class Database:
                     UNIQUE (message_id, report_no)
                 );
 
+                -- A server that swaps the raw content behind a UID without
+                -- changing UIDVALIDITY violates UID immutability.  The
+                -- committed message_record (decision, receipt, deliveries,
+                -- reports) is kept untouched; the observation is recorded
+                -- here exactly once per (uid, observed content) so the web
+                -- UI can show the new content's digest and the reason.
+                CREATE TABLE IF NOT EXISTS uid_anomaly (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account TEXT NOT NULL,
+                    mailbox TEXT NOT NULL,
+                    uidvalidity INTEGER NOT NULL,
+                    uid INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL REFERENCES message_record(id),
+                    expected_sha256 TEXT NOT NULL,
+                    observed_sha256 TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    observed_path TEXT,
+                    scan_instance TEXT,
+                    seen_count INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    UNIQUE (account, mailbox, uidvalidity, uid, observed_sha256)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_message_created
                     ON message_record(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_message_mark
@@ -171,6 +196,10 @@ class Database:
                     ON report(account, mailbox, report_no);
                 CREATE INDEX IF NOT EXISTS idx_delivery_message
                     ON delivery(message_id);
+                CREATE INDEX IF NOT EXISTS idx_uid_anomaly_message
+                    ON uid_anomaly(message_id);
+                CREATE INDEX IF NOT EXISTS idx_uid_anomaly_created
+                    ON uid_anomaly(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_scan_started
                     ON scan_run(started_at DESC);
                 """
@@ -181,6 +210,10 @@ class Database:
             if "marked" not in scan_cols:
                 conn.execute(
                     "ALTER TABLE scan_run ADD COLUMN marked INTEGER NOT NULL DEFAULT 0"
+                )
+            if "anomalies" not in scan_cols:
+                conn.execute(
+                    "ALTER TABLE scan_run ADD COLUMN anomalies INTEGER NOT NULL DEFAULT 0"
                 )
             state_cols = {row[1] for row in conn.execute("PRAGMA table_info(mailbox_state)")}
             if "scan_lease_seconds" not in state_cols:
@@ -372,7 +405,7 @@ class Database:
                     """UPDATE scan_run
                        SET status=?, finished_at=?, scanned=?, accepted=?,
                            rejected=?, skipped=?, reused_reports=?, marked=?,
-                           error=?
+                           anomalies=?, error=?
                        WHERE token=?""",
                     (
                         status,
@@ -383,6 +416,7 @@ class Database:
                         counts.get("skipped", 0),
                         counts.get("reused_reports", 0),
                         counts.get("marked", 0),
+                        counts.get("anomalies", 0),
                         error,
                         token,
                     ),
@@ -527,6 +561,94 @@ class Database:
                 (limit,),
             ).fetchall()
 
+    # --------------------------------------------------------------- anomalies
+    def record_uid_anomaly(
+        self,
+        account: str,
+        mailbox: str,
+        uidvalidity: int,
+        uid: int,
+        message_id: int,
+        expected_sha256: str,
+        observed_sha256: str,
+        reason_code: str,
+        reason: str,
+        scan_instance: str,
+        observed_path: str | None = None,
+    ) -> bool:
+        """Record a same-UID content swap exactly once.
+
+        The identity of an anomaly is ``(account, mailbox, uidvalidity, uid,
+        observed_sha256)``: re-scanning the same swapped content only
+        refreshes ``last_seen_at``/``seen_count`` of the existing row, so two
+        instances and repeated scans cannot create duplicates.  Returns True
+        when a new row was inserted.
+        """
+        now = utcnow()
+        with self.connect() as conn:
+            with transaction(conn):
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO uid_anomaly
+                       (account, mailbox, uidvalidity, uid, message_id,
+                        expected_sha256, observed_sha256, reason_code, reason,
+                        observed_path, scan_instance, seen_count,
+                        created_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                    (
+                        account,
+                        mailbox,
+                        uidvalidity,
+                        uid,
+                        message_id,
+                        expected_sha256,
+                        observed_sha256,
+                        reason_code,
+                        reason,
+                        observed_path,
+                        scan_instance,
+                        now,
+                        now,
+                    ),
+                )
+                if cur.rowcount == 1:
+                    return True
+                conn.execute(
+                    """UPDATE uid_anomaly
+                       SET last_seen_at=?, seen_count=seen_count+1,
+                           scan_instance=?
+                       WHERE account=? AND mailbox=? AND uidvalidity=? AND uid=?
+                         AND observed_sha256=?""",
+                    (
+                        now,
+                        scan_instance,
+                        account,
+                        mailbox,
+                        uidvalidity,
+                        uid,
+                        observed_sha256,
+                    ),
+                )
+                return False
+
+    def list_anomalies(self, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM uid_anomaly ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    def anomalies_for_message(self, message_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM uid_anomaly WHERE message_id=? ORDER BY id DESC",
+                (message_id,),
+            ).fetchall()
+
+    def get_anomaly(self, anomaly_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM uid_anomaly WHERE id=?", (anomaly_id,)
+            ).fetchone()
+
     def set_mark_state(self, message_id: int, state: str) -> None:
         with self.connect() as conn:
             with transaction(conn):
@@ -563,6 +685,7 @@ class Database:
                 "stale_marks": one("SELECT COUNT(*) FROM message_record WHERE mark_state='stale'"),
                 "reports": one("SELECT COUNT(*) FROM report"),
                 "scans": one("SELECT COUNT(*) FROM scan_run"),
+                "uid_anomalies": one("SELECT COUNT(*) FROM uid_anomaly"),
             }
 
     def recent_scans(self, limit: int = 20) -> list[sqlite3.Row]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from app.db import Database
+from app.db import Database, transaction
 
 
 def _db(tmp_path) -> Database:
@@ -90,3 +90,41 @@ def test_adopt_changed_uidvalidity_is_conditional(tmp_path):
     # The current owner can still report its own change.
     assert db.adopt_changed_uidvalidity("a@x", "INBOX", 3, 4, new_token)
     assert db.get_state("a@x", "INBOX")["uidvalidity"] == 4
+
+
+def test_uid_anomaly_is_recorded_once(tmp_path):
+    """The same (uid, observed content) anomaly is a single row; a different
+    observed content for the same UID is a new row."""
+    db = _db(tmp_path)
+    # A committed message to hang the anomaly on.
+    ok, token, _ = db.claim_scan("a@x", "INBOX", 1, "inst-a", 60)
+    assert ok
+    with db.connect() as conn:
+        with transaction(conn):
+            conn.execute(
+                """INSERT INTO message_record
+                   (account, mailbox, uidvalidity, uid, generation, raw_sha256,
+                    decision, mark_state, receipt_sha256, receipt_path,
+                    original_path, report_nos, created_at, updated_at)
+                   VALUES ('a@x', 'INBOX', 1, 7, 1, 'old-sha', 'accepted',
+                           'pending', 'r', 'receipts/r.json', 'msgs/o.eml',
+                           '[]', 'now', 'now')"""
+            )
+    message_id = 1
+    args = dict(
+        account="a@x", mailbox="INBOX", uidvalidity=1, uid=7,
+        message_id=message_id, expected_sha256="old-sha",
+        reason_code="uid_content_changed", reason="swapped",
+        scan_instance="inst-a",
+    )
+    assert db.record_uid_anomaly(observed_sha256="new-sha-1", **args) is True
+    # Same observation again (also from the other instance): no new row.
+    assert db.record_uid_anomaly(observed_sha256="new-sha-1", **{**args, "scan_instance": "inst-b"}) is False
+    rows = db.list_anomalies()
+    assert len(rows) == 1
+    assert rows[0]["seen_count"] == 2
+    assert rows[0]["message_id"] == message_id
+    # A different swapped content for the same UID is a distinct anomaly.
+    assert db.record_uid_anomaly(observed_sha256="new-sha-2", **args) is True
+    assert len(db.list_anomalies()) == 2
+    assert len(db.anomalies_for_message(message_id)) == 2

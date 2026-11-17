@@ -10,7 +10,8 @@ collector and the web UI:
 * ``GET /`` shows a small HTML console, ``POST /ctl/*`` drives the demo:
   deliver a message, rebuild the mailbox (new UIDVALIDITY, UIDs restart at 1),
   make the next ``UID STORE`` succeed and then drop the connection before
-  replying, and inspect flags.
+  replying, swap the raw content behind a UID while UIDVALIDITY stays the
+  same (and restore it again), and inspect flags.
 
 This server is for demonstration only.  It is not intended to be exposed to an
 untrusted network.
@@ -53,7 +54,11 @@ class MailboxStore:
     key_uid: dict[str, int] = field(default_factory=dict)      # maildir key -> uid
     lock: threading.RLock = field(default_factory=threading.RLock)
     drop_next_store: bool = False
+    fail_next_store: bool = False
     store_count: int = 0
+    # Bytes swapped out by ``replace`` so ``restore`` can put them back.
+    # Models a server that rewrites a UID's content while UIDVALIDITY stays.
+    replaced_raw: dict[int, bytes] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -175,6 +180,44 @@ class MailboxStore:
             box[key] = msg
             box.flush()
             self._ensure_uids()
+            return True
+
+    def replace(self, uid: int, raw: bytes) -> bool:
+        """Swap the raw content behind ``uid`` without touching UIDVALIDITY.
+
+        Assigning bytes to an existing Maildir key keeps the key (and
+        therefore the UID) and the current flags; only the bytes change.  The
+        previous served bytes are remembered so ``restore`` can put them
+        back, modelling a server that first rewrites a message and later
+        heals itself.
+        """
+        with self.lock:
+            box = self.box()
+            key = self.uid_map.get(uid)
+            if key is None or key not in box:
+                return False
+            if uid not in self.replaced_raw:
+                old = box.get_message(key)
+                self.replaced_raw[uid] = old.as_bytes(policy=default_policy)
+            box[key] = raw
+            box.flush()
+            self._ensure_uids()
+            return True
+
+    def restore(self, uid: int) -> bool:
+        """Put back the bytes that ``replace`` swapped out for ``uid``."""
+        with self.lock:
+            raw = self.replaced_raw.get(uid)
+            if raw is None:
+                return False
+            box = self.box()
+            key = self.uid_map.get(uid)
+            if key is None or key not in box:
+                return False
+            box[key] = raw
+            box.flush()
+            self._ensure_uids()
+            del self.replaced_raw[uid]
             return True
 
     def rebuild(self, purge: bool = False) -> dict[str, Any]:
@@ -367,6 +410,12 @@ class IMAPSession(socketserver.StreamRequestHandler):
         except ValueError:
             self._send(tag + b" BAD STORE\r\n")
             return
+        if self.store.fail_next_store:
+            self.store.fail_next_store = False
+            # Temporary failure: the flag is NOT applied and the client gets
+            # a plain NO, so the message stays unread on the server.
+            self._send(tag + b" NO store temporarily unavailable\r\n")
+            return
         if self.store.drop_next_store:
             self.store.drop_next_store = False
             # The flag is applied, but the client never sees the completion.
@@ -438,7 +487,9 @@ def build_control_handler(store: MailboxStore, imap_port: int):
                         "uidnext": store.uidnext,
                         "messages": store.all_flags(),
                         "drop_next_store": store.drop_next_store,
+                        "fail_next_store": store.fail_next_store,
                         "stores": store.store_count,
+                        "replaced_uids": sorted(store.replaced_raw),
                     }
                 )
                 return
@@ -465,6 +516,32 @@ def build_control_handler(store: MailboxStore, imap_port: int):
                 payload = json.loads(body or b"{}")
                 store.drop_next_store = bool(payload.get("enabled", True))
                 self._json({"ok": True, "drop_next_store": store.drop_next_store})
+                return
+            if path == "/ctl/fail-store":
+                # Next STORE refuses without applying the flag: the message
+                # stays unread, modelling a temporary mark failure.
+                payload = json.loads(body or b"{}")
+                store.fail_next_store = bool(payload.get("enabled", True))
+                self._json({"ok": True, "fail_next_store": store.fail_next_store})
+                return
+            if path == "/ctl/replace":
+                # Swap the raw content behind a UID while UIDVALIDITY stays
+                # the same (the anomaly the collector must survive).  Body is
+                # a JSON mail spec like /ctl/deliver plus "uid", or a JSON
+                # string in "raw".
+                payload = json.loads(body or b"{}")
+                uid = int(payload["uid"])
+                raw = payload["raw"].encode("utf-8") if "raw" in payload else build_demo_mail(payload)
+                ok = store.replace(uid, raw)
+                status = 200 if ok else 404
+                self._json({"ok": ok, "uid": uid, "uidvalidity": store.uidvalidity}, status)
+                return
+            if path == "/ctl/restore":
+                payload = json.loads(body or b"{}")
+                uid = int(payload["uid"])
+                ok = store.restore(uid)
+                status = 200 if ok else 404
+                self._json({"ok": ok, "uid": uid, "uidvalidity": store.uidvalidity}, status)
                 return
             if path == "/ctl/raw":
                 raw = body
@@ -542,7 +619,9 @@ UIDNEXT <strong>{store.uidnext}</strong>。“标记后断连”下一次 STORE�
 <p>投递演示邮件、重建邮箱、开启标记后断连均可通过控制 API 完成，例如：</p>
 <pre>curl -X POST localhost:8081/ctl/deliver -d '{{"subject":"演示"}}'
 curl -X POST localhost:8081/ctl/rebuild
-curl -X POST localhost:8081/ctl/drop-store -d '{{"enabled":true}}'</pre>
+curl -X POST localhost:8081/ctl/drop-store -d '{{"enabled":true}}'
+curl -X POST localhost:8081/ctl/replace -d '{{"uid":1,"subject":"swapped"}}'
+curl -X POST localhost:8081/ctl/restore -d '{{"uid":1}}'</pre>
 <p>完整演示流程见 <code>scripts/demo.sh</code>。</p>
 </html>"""
 

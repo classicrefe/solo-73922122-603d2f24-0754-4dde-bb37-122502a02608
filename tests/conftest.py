@@ -69,6 +69,17 @@ class Demo:
         payload.update(kwargs)
         return self.maildir.deliver(build_demo_mail(payload))
 
+    def replace(self, uid: int, subject: str = "swapped", attachments=None, **kwargs) -> bool:
+        """Swap the content behind ``uid`` while UIDVALIDITY stays the same."""
+        payload = {"subject": subject}
+        if attachments is not None:
+            payload["attachments"] = attachments
+        payload.update(kwargs)
+        return self.maildir.replace(uid, build_demo_mail(payload))
+
+    def restore(self, uid: int) -> bool:
+        return self.maildir.restore(uid)
+
     @staticmethod
     def attachment(report_no: str, value: str = "12", rows=None) -> dict:
         return {
